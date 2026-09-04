@@ -45,10 +45,12 @@ while True:
 
         prev_left = left_motor.angle()
         prev_right = right_motor.angle()
+        hub.imu.reset_heading(0)
 
         while Button.CENTER not in hub.buttons.pressed():
             left = left_motor.angle()
             right = right_motor.angle()
+            heading = hub.imu.heading()
 
             dleft = left - prev_left
             dright = right - prev_right
@@ -56,8 +58,8 @@ while True:
             prev_left = left
             prev_right = right
 
-            print("ROW: Left: {}, Right: {}, DLeft: {}, DRight: {}".format(
-                left, right, dleft, dright))
+            print("ROW: Left: {}, Right: {}, DLeft: {}, DRight: {}, Heading: {}".format(
+                left, right, dleft, dright, heading))
 
             wait(333)
 

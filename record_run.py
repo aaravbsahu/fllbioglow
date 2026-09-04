@@ -9,10 +9,13 @@ On the hub, running update_robot_code_pybricks.py:
   - RIGHT (at home, "H") starts a recording, CENTER stops it. Each one is
     saved here as runs/run_<timestamp>.csv.
   - LEFT counts up (shown on the display), RIGHT counts back down to home.
-  - CENTER, with a number selected, replays runs/<N>_run_*.csv -- rename a
-    run file yourself to give it that prefix. This script builds a one-off
-    Pybricks program reproducing the recorded motor deltas and runs it in
-    place of the main program, then restarts the main program when done.
+  - CENTER, with a number selected, replays runs/<N>_run_*.csv -- rename
+    run files yourself to give them that prefix. Multiple files can share
+    a prefix (e.g. 3_run_a.csv, 3_run_b.csv); they're averaged sample by
+    sample (truncated to the shortest one) before replay. This script
+    builds a one-off Pybricks program reproducing the resulting motor
+    deltas and runs it in place of the main program, then restarts the
+    main program when done.
   - During a replay, pressing CENTER three times stops it early and
     returns home.
 
@@ -76,7 +79,8 @@ cpb.unpack_hub_capabilities = patched_caps
 
 
 ROW_RE = re.compile(
-    r"ROW: Left:\s*(-?\d+), Right:\s*(-?\d+), DLeft:\s*(-?\d+), DRight:\s*(-?\d+)"
+    r"ROW: Left:\s*(-?\d+), Right:\s*(-?\d+), DLeft:\s*(-?\d+), DRight:\s*(-?\d+), "
+    r"Heading:\s*(-?\d+(?:\.\d+)?)"
 )
 REPLAY_RE = re.compile(r"REPLAY_REQUEST:\s*(\d+)")
 
@@ -133,16 +137,33 @@ print("REPLAY_ABORTED" if aborted else "REPLAY_DONE")
 """
 
 
-def find_run_csv(n):
-    matches = sorted(RUNS_DIR.glob(f"{n}_run_*.csv"))
-    return matches[-1] if matches else None
+def find_run_csvs(n):
+    return sorted(RUNS_DIR.glob(f"{n}_run_*.csv"))
 
 
-def build_replay_script(csv_path):
+def read_deltas(csv_path):
     deltas = []
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             deltas.append((int(row["dleft"]), int(row["dright"])))
+    return deltas
+
+
+def average_deltas(csv_paths):
+    """Averages multiple recordings sample-by-sample, truncated to the
+    length of the shortest one."""
+    runs = [read_deltas(p) for p in csv_paths]
+    length = min(len(run) for run in runs)
+    return [
+        (
+            round(sum(run[i][0] for run in runs) / len(runs)),
+            round(sum(run[i][1] for run in runs) / len(runs)),
+        )
+        for i in range(length)
+    ]
+
+
+def build_replay_script(deltas):
     code = REPLAY_TEMPLATE.format(deltas=deltas, interval_ms=333)
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", prefix="_replay_", delete=False, dir=REPO_ROOT
@@ -194,7 +215,7 @@ async def main():
                         run_file = open(run_path, "w", newline="")
                         run_writer = csv.writer(run_file)
                         run_writer.writerow(
-                            ["timestamp", "left", "right", "dleft", "dright"]
+                            ["timestamp", "left", "right", "dleft", "dright", "heading"]
                         )
                         run_file.flush()
                         print(f"Recording to {run_path}")
@@ -241,14 +262,16 @@ async def main():
                 current_script = MAIN_SCRIPT
                 continue
 
-            csv_path = find_run_csv(replay_requested)
-            if csv_path is None:
-                print(f"No run found starting with '{replay_requested}_run_'")
+            csv_paths = find_run_csvs(replay_requested)
+            if not csv_paths:
+                print(f"No runs found starting with '{replay_requested}_run_'")
                 current_script = MAIN_SCRIPT
                 continue
 
-            print(f"Replaying {csv_path}")
-            replay_script = build_replay_script(csv_path)
+            names = ", ".join(p.name for p in csv_paths)
+            print(f"Replaying average of {len(csv_paths)} run(s): {names}")
+            deltas = average_deltas(csv_paths)
+            replay_script = build_replay_script(deltas)
             try:
                 await hub.run(str(replay_script), wait=True, print_output=True)
             finally:
