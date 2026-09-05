@@ -93,6 +93,17 @@ REPO_ROOT = Path(__file__).resolve().parent
 RUNS_DIR = REPO_ROOT / "runs"
 MAIN_SCRIPT = REPO_ROOT / "update_robot_code_pybricks.py"
 
+# Replay model (from GummyBears Robotics' "trendline navigation" approach,
+# https://www.youtube.com/watch?v=YvdNfw3_fhA): distance is the master
+# variable and heading is a function of distance. The robot drives its
+# recorded path at a steady cruise speed while a P-controller steers so
+# the gyro heading matches the recorded heading for the current point.
+#
+# The path is parameterized by `s` = cumulative (|dist change| + K_ROT *
+# |heading change|), so it advances even during an in-place rotation and
+# stays single-valued when the run reverses. `dist` is the encoder proxy
+# (right_angle - left_angle) / 2. Because this robot's wheels are
+# mirrored, a spin adds the SAME term to both wheel commands.
 REPLAY_TEMPLATE = """from pybricks.hubs import PrimeHub
 from pybricks.pupdevices import Motor
 from pybricks.parameters import Port, Button
@@ -105,101 +116,98 @@ hub.imu.reset_heading(0)  # match the 0-reference the recording started from
 left_motor = Motor(Port.C)
 right_motor = Motor(Port.E)
 
-# Each step is (dleft, dright, heading) -- heading is the IMU heading the
-# hub recorded at that point in the original run. Timing doesn't need to
-# match the recording; hitting the recorded heading at each step does, so
-# wheel angle is only a starting estimate and the heading correction below
-# is the authority on when a step is actually done.
-steps = {steps!r}
+# (s, dist, heading) rows.
+table = {table!r}
+S_FINAL = table[-1][0]
+K_ROT = {k_rot}
+
+CRUISE = 600           # deg/s wheel speed along the path
+KP_SYNC = 1.5          # keeps actual distance synced to the target
+KP_HEAD = 9.0          # steering gain
+MAX_CMD = 950          # deg/s hard cap per wheel
+LOOKAHEAD = 40         # path units ahead, to read local travel direction
+WATCHDOG_MS = 180000
+REPORT_EVERY = 50      # ticks (~1s); printing over BLE stalls the loop
 
 watchdog = StopWatch()
-MAX_TOTAL_MS = 60000  # hard stop so a stuck correction can't run forever
-
-TURN_SPEED_MIN = 60  # deg/s, for heading correction
-TURN_SPEED_MAX = 300
-HEADING_TOLERANCE = 3  # degrees
-CORRECT_TIMEOUT_MS = 2000
-MOVE_TIMEOUT_MS = 2000
-
 press_count = 0
 was_pressed = False
 aborted = False
 
 
-def check_abort():
-    global press_count, was_pressed, aborted
+def dist_now():
+    return (right_motor.angle() - left_motor.angle()) / 2
+
+
+def interp(q):
+    if q <= table[0][0]:
+        return table[0][1], table[0][2]
+    if q >= table[-1][0]:
+        return table[-1][1], table[-1][2]
+    lo, hi = 0, len(table) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if table[mid][0] <= q:
+            lo = mid
+        else:
+            hi = mid
+    s0, d0, h0 = table[lo]
+    s1, d1, h1 = table[hi]
+    f = (q - s0) / (s1 - s0) if s1 > s0 else 0.0
+    return d0 + f * (d1 - d0), h0 + f * (h1 - h0)
+
+
+def clamp(v, lim):
+    return lim if v > lim else (-lim if v < -lim else v)
+
+
+zero = dist_now()
+d_prev = 0.0
+h_prev = hub.imu.heading()
+s = 0.0
+ticks = 0
+
+while True:
+    if watchdog.time() > WATCHDOG_MS:
+        print("REPLAY watchdog timeout")
+        break
+
     pressed = Button.CENTER in hub.buttons.pressed()
     if pressed and not was_pressed:
         press_count += 1
-        if press_count >= 3:
-            aborted = True
     was_pressed = pressed
-    return aborted
-
-
-def correct_heading(target):
-    \"\"\"Returns True if it converged, False if it timed out.\"\"\"
-    elapsed = 0
-    while elapsed < CORRECT_TIMEOUT_MS:
-        if check_abort():
-            return False
-        error = target - hub.imu.heading()
-        if abs(error) <= HEADING_TOLERANCE:
-            left_motor.stop()
-            right_motor.stop()
-            return True
-        # Speed scales with how far off we are, so small errors get precise
-        # slow corrections and large ones get corrected quickly.
-        speed = min(TURN_SPEED_MAX, max(TURN_SPEED_MIN, abs(error) * 8))
-        # Recorded convention: heading increases when dleft is negative and
-        # dright is positive (see update_robot_code_pybricks.py's ROW log).
-        if error > 0:
-            left_motor.run(-speed)
-            right_motor.run(speed)
-        else:
-            left_motor.run(speed)
-            right_motor.run(-speed)
-        wait(20)
-        elapsed += 20
-    left_motor.stop()
-    right_motor.stop()
-    return False
-
-
-step_num = 0
-for dleft, dright, heading in steps:
-    step_num += 1
-    if aborted:
-        break
-    if watchdog.time() > MAX_TOTAL_MS:
-        print("REPLAY watchdog timeout")
+    if press_count >= 3:
         aborted = True
         break
 
-    if dleft:
-        left_motor.run_angle(max(abs(dleft), 1) / 0.333, dleft, wait=False)
-    if dright:
-        right_motor.run_angle(max(abs(dright), 1) / 0.333, dright, wait=False)
-
-    elapsed = 0
-    while elapsed < MOVE_TIMEOUT_MS:
-        if check_abort():
-            break
-        if left_motor.done() and right_motor.done():
-            break
-        wait(20)
-        elapsed += 20
-
-    if aborted:
+    d = dist_now() - zero
+    h = hub.imu.heading()
+    s += abs(d - d_prev) + K_ROT * abs(h - h_prev)
+    d_prev = d
+    h_prev = h
+    if s >= S_FINAL:
         break
 
-    print("STEP {{}}/{{}} after-move={{:.1f}}".format(
-        step_num, len(steps), hub.imu.heading()))
+    dist_t, head_t = interp(s)
+    dist_ahead, _ = interp(s + LOOKAHEAD)
+    path_dir = 1.0 if dist_ahead >= dist_t else -1.0
 
-    converged = correct_heading(heading)
-    print("STEP {{}}/{{}} target={{:.1f}} achieved={{:.1f}} {{}}".format(
-        step_num, len(steps), heading, hub.imu.heading(),
-        "ok" if converged else "TIMEOUT"))
+    # steady cruise in the local travel direction + small sync correction
+    drive = path_dir * CRUISE + KP_SYNC * (dist_t - d)
+    # spin term: same sign on both wheels (mirrored wheels)
+    turn = KP_HEAD * (h - head_t)
+
+    left_cmd = clamp(-drive + turn, MAX_CMD)
+    right_cmd = clamp(drive + turn, MAX_CMD)
+    left_motor.run(left_cmd)
+    right_motor.run(right_cmd)
+
+    ticks += 1
+    if ticks % REPORT_EVERY == 0:
+        print("s={{:.0f}}/{{:.0f}} d {{:.0f}}>{{:.0f}} h {{:.0f}}>{{:.0f}}".format(
+            s, S_FINAL, d, dist_t, h, head_t))
+
+    wait(20)
 
 left_motor.stop()
 right_motor.stop()
@@ -211,33 +219,50 @@ def find_run_csvs(n):
     return sorted(RUNS_DIR.glob(f"{n}_run_*.csv"))
 
 
-def read_steps(csv_path):
-    steps = []
+def read_trajectory(csv_path):
+    """Returns [(dist, heading)] for a recording, dist zeroed to start at 0.
+    dist is the encoder proxy (right - left) / 2."""
+    pts = []
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
-            steps.append(
-                (int(row["dleft"]), int(row["dright"]), float(row.get("heading", 0)))
-            )
-    return steps
+            dist = (int(row["right"]) - int(row["left"])) / 2
+            pts.append((dist, float(row.get("heading", 0) or 0)))
+    if not pts:
+        return pts
+    d0 = pts[0][0]
+    return [(d - d0, h) for d, h in pts]
 
 
-def average_steps(csv_paths):
-    """Averages multiple recordings sample-by-sample, truncated to the
-    length of the shortest one."""
-    runs = [read_steps(p) for p in csv_paths]
-    length = min(len(run) for run in runs)
+def average_trajectories(csv_paths):
+    trajs = [read_trajectory(p) for p in csv_paths]
+    n = min(len(t) for t in trajs)
     return [
         (
-            round(sum(run[i][0] for run in runs) / len(runs)),
-            round(sum(run[i][1] for run in runs) / len(runs)),
-            sum(run[i][2] for run in runs) / len(runs),
+            sum(t[i][0] for t in trajs) / len(trajs),
+            sum(t[i][1] for t in trajs) / len(trajs),
         )
-        for i in range(length)
+        for i in range(n)
     ]
 
 
-def build_replay_script(steps):
-    code = REPLAY_TEMPLATE.format(steps=steps)
+K_ROT = 4.0  # weight of 1 deg heading change vs 1 unit distance, in path length
+
+
+def build_path_table(traj):
+    """Turns [(dist, heading)] into [(s, dist, heading)] where
+    s = cumulative (|dist change| + K_ROT * |heading change|)."""
+    table = []
+    s = 0.0
+    prev_d, prev_h = traj[0]
+    for d, h in traj:
+        s += abs(d - prev_d) + K_ROT * abs(h - prev_h)
+        prev_d, prev_h = d, h
+        table.append((round(s, 1), round(d, 1), round(h, 2)))
+    return table
+
+
+def build_replay_script(table):
+    code = REPLAY_TEMPLATE.format(table=table, k_rot=K_ROT)
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", prefix="_replay_", delete=False, dir=REPO_ROOT
     )
@@ -368,8 +393,9 @@ async def main():
 
                 names = ", ".join(p.name for p in csv_paths)
                 print(f"Replaying average of {len(csv_paths)} run(s): {names}")
-                steps = average_steps(csv_paths)
-                replay_script = build_replay_script(steps)
+                table = build_path_table(average_trajectories(csv_paths))
+                print(f"  path length {table[-1][0]:.0f}, {len(table)} points")
+                replay_script = build_replay_script(table)
                 try:
                     await hub.run(str(replay_script), wait=True, print_output=True)
                 except Exception as e:

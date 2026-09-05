@@ -47,14 +47,31 @@ The display shows `H` (home) when idle.
    sample-by-sample (truncated to the shortest one).
 4. On the hub, LEFT to count up to `n`, then CENTER to replay.
 
-Each recorded row is `(dleft, dright, heading)` -- the motor angle change
-since the last sample, plus the hub's IMU heading (reset to 0 at the start of
-the recording). Replay does NOT just blindly re-run the recorded wheel
-angles: for each step it moves the wheels by roughly the recorded amount,
-then uses the IMU to correct the heading until it actually matches the
-recorded value for that step, since wheel angle alone drifts from reality
-(friction, wheel slip). Timing is not preserved on replay -- getting the
-heading/position right matters more than matching the original speed.
+Each recorded row has cumulative motor angles (`left`, `right`), the change
+since the last sample (`dleft`, `dright`), and the hub's IMU `heading`
+(reset to 0 at the start of the recording).
+
+### Replay model
+
+Based on GummyBears Robotics' "trendline navigation" approach
+(https://www.youtube.com/watch?v=YvdNfw3_fhA). **Distance is the master
+variable; heading is a function of distance.** The robot drives its recorded
+distance profile while a P-controller steers so the gyro heading matches the
+recorded heading for wherever it currently is along the path.
+
+- Distance is the wheel-encoder proxy `(right_angle - left_angle) / 2`.
+- The path is parameterized by cumulative *absolute* path length `s`, so a
+  run that reverses is still single-valued.
+- Each control tick runs two P-controllers:
+  - `drive = KP_DIST * (target_dist - actual_dist)` -- goes negative and
+    reverses automatically when the recorded path doubles back.
+  - `steer = KP_HEAD * (target_heading - gyro_heading)`.
+- Stops when `s` reaches the recorded total. Timing is not preserved.
+
+The gains (`KP_DIST`, `KP_HEAD`, `MAX_SPEED`) live in `REPLAY_TEMPLATE` in
+`record_run.py` and still need tuning for this robot. Replay prints a
+progress line every ~15 ticks: `s=.../... dist X->Y head A->B` (actual ->
+target).
 
 ## Known issues / things to watch for
 
@@ -76,16 +93,14 @@ heading/position right matters more than matching the original speed.
   `unpack_hub_capabilities()` parsing only the first 10 bytes (newer firmware
   appends one more). To retire these patches: install Python 3.11+ and a
   current `pybricksdev`.
-- **The heading-correction replay is still being tuned.** The turn speed and
-  timeouts in `record_run.py`'s `REPLAY_TEMPLATE` were guessed without
-  knowing the robot's actual wheel diameter/track width, so convergence can
-  be slow or fail to converge within the per-step timeout on sharp turns.
-  Replay prints `STEP n/N after-move=X` and `STEP n/N target=X achieved=Y
-  ok/TIMEOUT` for every step so you can see exactly where it's diverging.
-  There's a 60-second hard watchdog cutoff so a stuck replay can't run
-  forever, but it may still need to be aborted by hand (3x CENTER) or the
-  hub power-cycled if the robot is doing something unwanted.
-- **Not yet implemented:** using the recorded heading to actively verify the
-  robot reached the right position rather than just matching heading -- the
-  data is recorded and available (`runs/*.csv`'s `heading` column) but only
-  the replay's per-step turn correction uses it so far.
+- **Replay gains still need tuning.** `KP_DIST`, `KP_HEAD`, and `MAX_SPEED`
+  in `REPLAY_TEMPLATE` were guessed. If steering goes the wrong way, flip the
+  sign on the `steer` term (or the `if drive < 0: steer = -steer` line).
+  There's a 60-second watchdog so a stuck replay can't run forever, but it
+  may still need a 3x-CENTER abort or a hub power-cycle if the robot does
+  something unwanted.
+- **Distance from the encoders, not the gyro.** The IMU can't give a usable
+  distance (accelerometer integration drifts badly at robot speeds), so the
+  wheel encoders are the distance authority. Wheel slip still means encoder
+  distance can differ from real ground distance; there's no on-robot sensor
+  to close that gap.
