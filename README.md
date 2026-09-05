@@ -42,7 +42,7 @@ Because Google Sheets requires passwords, we created a Google Apps Script that a
 
 ---
 
-### Step 2: Configure the Robot Code (`Project 13.llsp3`)
+### Step 2: Configure the Robot Code (`Recorder.llsp3`)
 We modified the Python program inside the SPIKE Prime project to send a message over the USB cable after the robot says "bye":
 
 ```python

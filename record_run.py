@@ -121,13 +121,22 @@ table = {table!r}
 S_FINAL = table[-1][0]
 K_ROT = {k_rot}
 
-CRUISE = 600           # deg/s wheel speed along the path
+DIST_SCALE = 1.0       # calibration: >1 makes replay travel farther
+CRUISE = 600           # deg/s wheel speed on the straights
 KP_SYNC = 1.5          # keeps actual distance synced to the target
 KP_HEAD = 9.0          # steering gain
 MAX_CMD = 950          # deg/s hard cap per wheel
-LOOKAHEAD = 40         # path units ahead, to read local travel direction
+LOOKAHEAD = 40         # +/- path units, window for reading local travel
+HEAD_DEADBAND = 0.15   # deg/tick of heading noise to keep out of `s`
+FINISH_DIST_TOL = 15   # motor-deg: close enough to the recorded end
+FINISH_HEAD_TOL = 4    # deg
+FINISH_TIMEOUT_MS = 8000
 WATCHDOG_MS = 180000
 REPORT_EVERY = 50      # ticks (~1s); printing over BLE stalls the loop
+
+END_DIST = table[-1][1] * DIST_SCALE
+END_HEAD = table[-1][2]
+print("target end dist {{:.0f}}".format(END_DIST))
 
 watchdog = StopWatch()
 press_count = 0
@@ -141,9 +150,9 @@ def dist_now():
 
 def interp(q):
     if q <= table[0][0]:
-        return table[0][1], table[0][2]
+        return table[0][1] * DIST_SCALE, table[0][2]
     if q >= table[-1][0]:
-        return table[-1][1], table[-1][2]
+        return table[-1][1] * DIST_SCALE, table[-1][2]
     lo, hi = 0, len(table) - 1
     while hi - lo > 1:
         mid = (lo + hi) // 2
@@ -154,7 +163,7 @@ def interp(q):
     s0, d0, h0 = table[lo]
     s1, d1, h1 = table[hi]
     f = (q - s0) / (s1 - s0) if s1 > s0 else 0.0
-    return d0 + f * (d1 - d0), h0 + f * (h1 - h0)
+    return (d0 + f * (d1 - d0)) * DIST_SCALE, h0 + f * (h1 - h0)
 
 
 def clamp(v, lim):
@@ -166,6 +175,10 @@ d_prev = 0.0
 h_prev = hub.imu.heading()
 s = 0.0
 ticks = 0
+finishing = False
+finish_start = 0
+path_dir = 1.0
+WINDOW = 2.0 * LOOKAHEAD
 
 while True:
     if watchdog.time() > WATCHDOG_MS:
@@ -182,20 +195,48 @@ while True:
 
     d = dist_now() - zero
     h = hub.imu.heading()
-    s += abs(d - d_prev) + K_ROT * abs(h - h_prev)
+    dh = abs(h - h_prev)
+    if dh < HEAD_DEADBAND:
+        dh = 0.0
+    s += abs(d - d_prev) + K_ROT * dh
     d_prev = d
     h_prev = h
-    if s >= S_FINAL:
-        break
 
-    dist_t, head_t = interp(s)
-    dist_ahead, _ = interp(s + LOOKAHEAD)
-    path_dir = 1.0 if dist_ahead >= dist_t else -1.0
+    if not finishing and s >= S_FINAL:
+        finishing = True
+        finish_start = watchdog.time()
 
-    # steady cruise in the local travel direction + small sync correction
-    drive = path_dir * CRUISE + KP_SYNC * (dist_t - d)
-    # spin term: same sign on both wheels (mirrored wheels)
-    turn = KP_HEAD * (h - head_t)
+    if finishing:
+        # drive straight to the recorded end distance/heading
+        dist_t, head_t = END_DIST, END_HEAD
+        if (abs(END_DIST - d) <= FINISH_DIST_TOL
+                and abs(END_HEAD - h) <= FINISH_HEAD_TOL):
+            break
+        if watchdog.time() - finish_start > FINISH_TIMEOUT_MS:
+            print("finish timeout d={{:.0f}}/{{:.0f}}".format(d, END_DIST))
+            break
+        drive = clamp(3.0 * (END_DIST - d), CRUISE)
+        turn = KP_HEAD * (h - END_HEAD)
+    else:
+        dist_t, head_t = interp(s)
+        dist_behind, _ = interp(s - LOOKAHEAD)
+        dist_ahead, _ = interp(s + LOOKAHEAD)
+        travel = dist_ahead - dist_behind
+        if travel > 5:
+            path_dir = 1.0
+        elif travel < -5:
+            path_dir = -1.0
+        # else: keep last path_dir (pure rotation -- don't flip direction)
+
+        # scale cruise down where the path is rotation-heavy, so turns are
+        # clean pivots instead of slow arcs
+        trans_frac = abs(travel) / WINDOW
+        if trans_frac > 1.0:
+            trans_frac = 1.0
+
+        drive = path_dir * CRUISE * trans_frac + KP_SYNC * (dist_t - d)
+        # spin term: same sign on both wheels (mirrored wheels)
+        turn = KP_HEAD * (h - head_t)
 
     left_cmd = clamp(-drive + turn, MAX_CMD)
     right_cmd = clamp(drive + turn, MAX_CMD)
@@ -211,6 +252,8 @@ while True:
 
 left_motor.stop()
 right_motor.stop()
+print("end dist {{:.0f}}/{{:.0f}}  end head {{:.1f}}/{{:.1f}}".format(
+    dist_now() - zero, END_DIST, hub.imu.heading(), END_HEAD))
 print("REPLAY_ABORTED" if aborted else "REPLAY_DONE")
 """
 

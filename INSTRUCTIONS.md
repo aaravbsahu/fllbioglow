@@ -93,12 +93,16 @@ target).
   `unpack_hub_capabilities()` parsing only the first 10 bytes (newer firmware
   appends one more). To retire these patches: install Python 3.11+ and a
   current `pybricksdev`.
-- **Replay gains still need tuning.** `KP_DIST`, `KP_HEAD`, and `MAX_SPEED`
-  in `REPLAY_TEMPLATE` were guessed. If steering goes the wrong way, flip the
-  sign on the `steer` term (or the `if drive < 0: steer = -steer` line).
-  There's a 60-second watchdog so a stuck replay can't run forever, but it
-  may still need a 3x-CENTER abort or a hub power-cycle if the robot does
-  something unwanted.
+- **Replay gains still need tuning.** `CRUISE`, `KP_HEAD`, `KP_SYNC`,
+  `MAX_CMD` in `REPLAY_TEMPLATE` were guessed. If steering goes the wrong
+  way, flip the sign on the `turn` term. There's a watchdog so a stuck
+  replay can't run forever, but it may still need a 3x-CENTER abort or a hub
+  power-cycle if the robot does something unwanted.
+- **`DIST_SCALE` calibration.** Replay prints `target end dist X` at the
+  start and `end dist Y/X` at the end. If replay consistently runs short or
+  long by a roughly fixed ratio, set `DIST_SCALE` in `REPLAY_TEMPLATE`
+  (e.g. 1.1 if it runs ~10% short). After the path completes there's a
+  finish phase that drives straight to the recorded end distance/heading.
 - **Distance from the encoders, not the gyro.** The IMU can't give a usable
   distance (accelerometer integration drifts badly at robot speeds), so the
   wheel encoders are the distance authority. Wheel slip still means encoder
