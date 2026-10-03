@@ -6,8 +6,10 @@ from pybricks.tools import wait
 hub = PrimeHub()
 hub.system.set_stop_button(None)  # let us read the buttons ourselves
 
-left_motor = Motor(Port.C)
+left_motor = Motor(Port.F)
 right_motor = Motor(Port.E)
+right_arm_motor = Motor(Port.C)
+left_arm_motor = Motor(Port.D)
 
 
 def wait_for_release(button):
@@ -45,21 +47,31 @@ while True:
 
         prev_left = left_motor.angle()
         prev_right = right_motor.angle()
+        prev_right_arm = right_arm_motor.angle()
+        prev_left_arm = left_arm_motor.angle()
         hub.imu.reset_heading(0)
 
         while Button.CENTER not in hub.buttons.pressed():
             left = left_motor.angle()
             right = right_motor.angle()
+            right_arm = right_arm_motor.angle()
+            left_arm = left_arm_motor.angle()
             heading = hub.imu.heading()
 
             dleft = left - prev_left
             dright = right - prev_right
+            dright_arm = right_arm - prev_right_arm
+            dleft_arm = left_arm - prev_left_arm
 
             prev_left = left
             prev_right = right
+            prev_right_arm = right_arm
+            prev_left_arm = left_arm
 
-            print("ROW: Left: {}, Right: {}, DLeft: {}, DRight: {}, Heading: {}".format(
-                left, right, dleft, dright, heading))
+            print("ROW: Left: {}, Right: {}, DLeft: {}, DRight: {}, Heading: {}, "
+                  "RightArm: {}, LeftArm: {}, DRightArm: {}, DLeftArm: {}".format(
+                left, right, dleft, dright, heading,
+                right_arm, left_arm, dright_arm, dleft_arm))
 
             wait(333)
 

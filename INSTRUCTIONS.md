@@ -47,9 +47,11 @@ The display shows `H` (home) when idle.
    sample-by-sample (truncated to the shortest one).
 4. On the hub, LEFT to count up to `n`, then CENTER to replay.
 
-Each recorded row has cumulative motor angles (`left`, `right`), the change
-since the last sample (`dleft`, `dright`), and the hub's IMU `heading`
-(reset to 0 at the start of the recording).
+Each recorded row has cumulative drive motor angles (`left`, `right`), the
+change since the last sample (`dleft`, `dright`), the hub's IMU `heading`
+(reset to 0 at the start of the recording), and cumulative/delta angles for
+the two attachment motors (`right_arm`/`left_arm`, `dright_arm`/`dleft_arm`
+on ports C and D).
 
 ### Replay model
 
