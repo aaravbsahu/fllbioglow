@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
-"""Controller: keeps one persistent BLE connection to the hub and swaps
-which Pybricks program is running on it, without ever disconnecting.
+"""Controller: keeps one persistent BLE connection per connected robot and
+swaps which Pybricks program is running on each, without ever
+disconnecting. Runs NUM_ROBOTS independent "connect to whichever Pybricks
+hub is currently advertising" loops concurrently -- all connected robots
+record/replay independently and concurrently, saving into the same shared
+runs/ folder (there's no identification between robots; whichever one
+starts a recording or requests a replay, that's what happens on it).
+
+This works without needing to tell robots apart because a BLE peripheral
+stops advertising once it has a central connected to it: once loop A
+connects to whichever hub it found first, that hub stops advertising, so
+loop B's scan then only sees the other one. (We tried identifying hubs by
+BLE address and by Hub Name; address doesn't work because macOS doesn't
+give Pybricks hubs a stable address -- it can even change *within* a
+single scan -- and renaming hubs via Pybricks firmware reinstall turned
+out to be more hassle than wanted. This "whichever's free" approach
+doesn't need either.)
 
 Usage:
     python3 record_run.py
 
-On the hub, running update_robot_code_pybricks.py:
+On each hub, running update_robot_code_pybricks.py:
   - RIGHT (at home, "H") starts a recording, CENTER stops it. Each one is
-    saved here as runs/run_<timestamp>.csv.
+    saved to runs/run_<timestamp>.csv.
   - LEFT counts up (shown on the display), RIGHT counts back down to home.
   - CENTER, with a number selected, replays runs/<N>_run_*.csv -- rename
     run files yourself to give them that prefix. Multiple files can share
@@ -17,28 +32,27 @@ On the hub, running update_robot_code_pybricks.py:
     the wheels by roughly the recorded angle and then corrects with the
     hub's IMU until the recorded heading for that step is actually
     achieved, since wheel angle alone drifts from reality (friction,
-    slip). Timing isn't preserved -- position (heading) is the priority.
-    Runs in place of the main program, then restarts the main program
-    when done.
+    slip). Timing isn't preserved for driving -- position (heading) is
+    the priority. Runs in place of the main program, then restarts the
+    main program when done.
   - During a replay, pressing CENTER three times stops it early and
     returns home.
 
 Press Ctrl-C to stop.
 
-Why one persistent connection: disconnecting and reconnecting BLE between
-program swaps was unreliable on this Mac/firmware combination -- killing
-the connection left the hub's BLE stack in a stuck state for anywhere from
-15 seconds to over a minute before it would advertise again. Pybricks
-supports stopping and starting a new program over an already-open
-connection, so we do that instead and never disconnect until Ctrl-C.
+Why one persistent connection per robot: disconnecting and reconnecting
+BLE between program swaps was unreliable on this Mac/firmware combination
+-- killing the connection left the hub's BLE stack in a stuck state for
+anywhere from 15 seconds to over a minute before it would advertise
+again. Pybricks supports stopping and starting a new program over an
+already-open connection, so we do that instead and never disconnect until
+Ctrl-C.
 
-This also needs the same two monkeypatches as push_ble.py, for the same
-reason (system python3 is 3.9, pinning pybricksdev to an old release that
-predates some of this firmware's protocol details):
-  1. find_device() refuses a hub whose BLE advert has no name; macOS often
-     never surfaces one, so we match purely on the Pybricks service UUID.
-  2. unpack_hub_capabilities() hard-codes a 10-byte layout; newer firmware
-     appends a byte, so we parse the first 10 and ignore the rest.
+This also needs the same monkeypatch as push_ble.py, for the same reason
+(system python3 is 3.9, pinning pybricksdev to an old release that
+predates some of this firmware's protocol details): unpack_hub_capabilities()
+hard-codes a 10-byte layout; newer firmware appends a byte, so we parse
+the first 10 and ignore the rest.
 """
 import asyncio
 import csv
@@ -56,8 +70,16 @@ from bleak import BleakScanner
 from pybricksdev.connections import ConnectionState
 from pybricksdev.connections.pybricks import PybricksHub
 
+# How many robots to connect to simultaneously.
+NUM_ROBOTS = 1
 
-async def patched_find(name=None, service=ble.PYBRICKS_SERVICE_UUID, timeout=15):
+
+async def find_any_hub(service=ble.PYBRICKS_SERVICE_UUID, timeout=15):
+    """Finds any Pybricks hub currently advertising (i.e. not already
+    connected to something). Several of these can run concurrently --
+    once one succeeds, that hub stops advertising, so a concurrent call
+    naturally won't find the same device again."""
+
     def match(device, adv):
         return service in adv.service_uuids
 
@@ -68,8 +90,6 @@ async def patched_find(name=None, service=ble.PYBRICKS_SERVICE_UUID, timeout=15)
         raise asyncio.TimeoutError
     return dev
 
-
-ble.find_device = patched_find
 
 _HubCapabilityFlag = pb.HubCapabilityFlag
 
@@ -409,14 +429,234 @@ def build_segments(traj):
     return segments
 
 
-def build_replay_script(segments):
+def build_replay_script(segments, slot):
     code = REPLAY_TEMPLATE.format(segments=segments, k_rot=K_ROT)
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", prefix="_replay_", delete=False, dir=REPO_ROOT
+        mode="w", suffix=".py", prefix=f"_replay_{slot}_", delete=False, dir=REPO_ROOT
     )
     tmp.write(code)
     tmp.close()
     return Path(tmp.name)
+
+
+# --- Deterministic script generation ---------------------------------
+#
+# The REPLAY_TEMPLATE approach above re-interprets the recorded CSV every
+# time it replays, driven by a big embedded data table. This is a
+# different output: a flat, ordinary-looking Pybricks program with a
+# hardcoded sequence of drive(...)/turn(...)/arm_to(...) calls -- meant to
+# be generated once from a recording and then hand-edited (tune a
+# distance, nudge a turn angle, delete a step) rather than regenerated.
+# Each call still uses the gyro to correct drift during its own leg, the
+# same way the recording-replay does, just one discrete leg at a time
+# instead of a continuous path-following loop.
+
+TURN_HEADING_THRESH = 3  # deg/sample: a row counts as "turning" past this
+MIN_DRIVE_DIST = 10      # encoder-deg: skip legs smaller than this (noise)
+MIN_TURN_ANGLE = 3       # deg: skip turns smaller than this (noise)
+
+
+def _classify_rows(traj):
+    """Labels each row 'arm', 'turn', or 'drive' based on the change from
+    the previous row. Row 0 copies row 1's label (nothing to compare it
+    to)."""
+    n = len(traj)
+    labels = ["drive"] * n
+    for i in range(1, n):
+        d0, h0, ra0, la0 = traj[i - 1]
+        d1, h1, ra1, la1 = traj[i]
+        if abs(ra1 - ra0) + abs(la1 - la0) > ARM_ACTIVE_THRESH:
+            labels[i] = "arm"
+        elif abs(h1 - h0) > TURN_HEADING_THRESH and abs(h1 - h0) > abs(d1 - d0):
+            labels[i] = "turn"
+        else:
+            labels[i] = "drive"
+    if n > 1:
+        labels[0] = labels[1]
+    return labels
+
+
+def build_program(traj):
+    """Turns [(dist, heading, right_arm, left_arm)] into a flat list of
+    steps: ("drive", delta_dist), ("turn", delta_heading), or
+    ("arm", right_arm, left_arm) -- one per recorded arm waypoint."""
+    n = len(traj)
+    if n == 0:
+        return []
+    labels = _classify_rows(traj)
+
+    steps = []
+    i = 0
+    while i < n:
+        label = labels[i]
+        j = i
+        while j < n and labels[j] == label:
+            j += 1
+        chunk = traj[i:j]
+
+        if label == "arm":
+            for _, _, ra, la in chunk:
+                steps.append(("arm", round(ra, 1), round(la, 1)))
+        elif label == "turn":
+            delta = chunk[-1][1] - chunk[0][1]
+            if abs(delta) >= MIN_TURN_ANGLE:
+                steps.append(("turn", round(delta, 1)))
+        else:
+            delta = chunk[-1][0] - chunk[0][0]
+            if abs(delta) >= MIN_DRIVE_DIST:
+                steps.append(("drive", round(delta, 1)))
+        i = j
+    return steps
+
+
+DETERMINISTIC_TEMPLATE = '''"""Deterministic replay, generated from {source}.
+
+Hand-edit the numbers in PROGRAM below to fine-tune -- each tuple is one
+step, run in order:
+  ("drive", encoder_degrees)   -- straight, holding heading via gyro
+  ("turn", degrees)            -- relative pivot turn, gyro-corrected
+  ("arm", right_angle, left_angle)  -- move arms to these angles
+    (relative to wherever the arms were at program start)
+Delete a step, change a number, add a new one -- it's just a list.
+"""
+from pybricks.hubs import PrimeHub
+from pybricks.pupdevices import Motor
+from pybricks.parameters import Port, Button
+from pybricks.tools import wait, StopWatch
+
+hub = PrimeHub()
+hub.system.set_stop_button(None)
+hub.imu.reset_heading(0)
+
+left_motor = Motor(Port.F)
+right_motor = Motor(Port.E)
+right_arm_motor = Motor(Port.C)
+left_arm_motor = Motor(Port.D)
+
+CRUISE = 600        # deg/s wheel speed while driving straight
+KP_HEAD = 9.0        # steering gain, both drive() and turn()
+MAX_CMD = 950        # deg/s hard cap per wheel
+DRIVE_TOL = 15       # encoder-deg: close enough to end a drive() leg
+TURN_TOL = 4         # deg: close enough to end a turn() leg
+ARM_TOL = 8          # motor-deg: close enough to end an arm_to() step
+STEP_TIMEOUT_MS = 6000
+WATCHDOG_MS = 180000
+
+watchdog = StopWatch()
+press_count = 0
+was_pressed = False
+aborted = False
+
+
+def dist_now():
+    return (right_motor.angle() - left_motor.angle()) / 2
+
+
+def clamp(v, lim):
+    return lim if v > lim else (-lim if v < -lim else v)
+
+
+def check_abort():
+    global press_count, was_pressed, aborted
+    pressed = Button.CENTER in hub.buttons.pressed()
+    if pressed and not was_pressed:
+        press_count += 1
+    was_pressed = pressed
+    if press_count >= 3:
+        aborted = True
+    return aborted
+
+
+def drive(distance):
+    """Drive `distance` encoder-degrees straight, holding the heading we
+    had when this step started."""
+    target_heading = hub.imu.heading()
+    start = dist_now()
+    target = start + distance
+    timer = StopWatch()
+    while not (aborted or watchdog.time() > WATCHDOG_MS):
+        if check_abort():
+            break
+        err = target - dist_now()
+        if abs(err) <= DRIVE_TOL or timer.time() > STEP_TIMEOUT_MS:
+            break
+        drive_cmd = clamp(3.0 * err, CRUISE)
+        turn_cmd = KP_HEAD * (hub.imu.heading() - target_heading)
+        left_motor.run(clamp(-drive_cmd + turn_cmd, MAX_CMD))
+        right_motor.run(clamp(drive_cmd + turn_cmd, MAX_CMD))
+        wait(20)
+    left_motor.stop()
+    right_motor.stop()
+
+
+def turn(angle):
+    """Pivot turn by `angle` degrees relative to the current heading,
+    using the gyro to stop exactly there."""
+    target_heading = hub.imu.heading() + angle
+    timer = StopWatch()
+    while not (aborted or watchdog.time() > WATCHDOG_MS):
+        if check_abort():
+            break
+        err = hub.imu.heading() - target_heading
+        if abs(err) <= TURN_TOL or timer.time() > STEP_TIMEOUT_MS:
+            break
+        turn_cmd = clamp(KP_HEAD * err, MAX_CMD)
+        left_motor.run(turn_cmd)
+        right_motor.run(turn_cmd)
+        wait(20)
+    left_motor.stop()
+    right_motor.stop()
+
+
+right_arm_zero = right_arm_motor.angle()
+left_arm_zero = left_arm_motor.angle()
+
+
+def arm_to(right_angle, left_angle):
+    """Move both arms to the given angles, relative to their position
+    when this program started."""
+    timer = StopWatch()
+    while not (aborted or watchdog.time() > WATCHDOG_MS):
+        if check_abort():
+            break
+        right_arm_motor.track_target(right_arm_zero + right_angle)
+        left_arm_motor.track_target(left_arm_zero + left_angle)
+        ra_now = right_arm_motor.angle() - right_arm_zero
+        la_now = left_arm_motor.angle() - left_arm_zero
+        reached = abs(ra_now - right_angle) <= ARM_TOL and abs(la_now - left_angle) <= ARM_TOL
+        if reached or timer.time() > STEP_TIMEOUT_MS:
+            break
+        wait(20)
+
+
+# PROGRAM: edit freely. Run in order, top to bottom.
+PROGRAM = [
+{program_lines}
+]
+
+for step in PROGRAM:
+    if aborted or watchdog.time() > WATCHDOG_MS:
+        break
+    kind = step[0]
+    if kind == "drive":
+        drive(step[1])
+    elif kind == "turn":
+        turn(step[1])
+    else:
+        arm_to(step[1], step[2])
+
+print("DETERMINISTIC_ABORTED" if aborted else "DETERMINISTIC_DONE")
+'''
+
+
+def build_deterministic_script(csv_paths, out_path):
+    traj = average_trajectories(csv_paths)
+    program = build_program(traj)
+    source = ", ".join(p.name for p in csv_paths)
+    program_lines = "\n".join(f"    {step!r}," for step in program)
+    code = DETERMINISTIC_TEMPLATE.format(program_lines=program_lines, source=source)
+    out_path.write_text(code)
+    return program
 
 
 def _is_connected(hub):
@@ -433,16 +673,20 @@ async def _reap(task):
             print(f"(background task ended with: {exc!r})")
 
 
-async def main():
-    RUNS_DIR.mkdir(exist_ok=True)
-
+async def run_robot(slot):
+    """Connects to whichever Pybricks hub is currently advertising and
+    runs the record/replay loop for it, forever (until cancelled).
+    `slot` is just an internal label (1, 2, ...) for log lines and temp
+    file names -- it has no relationship to which physical robot ends up
+    here, and two robots are otherwise treated identically, sharing the
+    same runs/ folder."""
     run_file = run_writer = run_path = None
 
     def close_run():
         nonlocal run_file, run_writer, run_path
         if run_file:
             run_file.close()
-            print(f"Saved {run_path}")
+            print(f"[{slot}] Saved {run_path}")
         run_file = run_writer = run_path = None
 
     try:
@@ -450,14 +694,14 @@ async def main():
             hub = PybricksHub()
             while True:
                 try:
-                    print("Searching for any hub with Pybricks service...")
-                    device = await ble.find_device(timeout=15)
+                    print(f"[{slot}] Searching for any hub with Pybricks service...")
+                    device = await find_any_hub(timeout=15)
                     await hub.connect(device)
                     break
                 except Exception as e:
-                    print(f"Connect failed ({e}), retrying...")
+                    print(f"[{slot}] Connect failed ({e}), retrying...")
                     await asyncio.sleep(1)
-            print(f"Connected to {device.address}")
+            print(f"[{slot}] Connected to {device.address}")
 
             current_script = MAIN_SCRIPT
             while _is_connected(hub):
@@ -467,7 +711,7 @@ async def main():
                     nonlocal replay_requested, run_file, run_writer, run_path
                     while True:
                         line = await hub.read_line()
-                        print(line)
+                        print(f"[{slot}] {line}")
 
                         if line == "RUN_START":
                             close_run()
@@ -481,7 +725,7 @@ async def main():
                                  "right_arm", "left_arm", "dright_arm", "dleft_arm"]
                             )
                             run_file.flush()
-                            print(f"Recording to {run_path}")
+                            print(f"[{slot}] Recording to {run_path}")
                             continue
 
                         if line == "RUN_STOP":
@@ -516,7 +760,7 @@ async def main():
                 )
 
                 if not _is_connected(hub):
-                    print("Hub disconnected, will reconnect...")
+                    print(f"[{slot}] Hub disconnected, will reconnect...")
                     reader_task.cancel()
                     await _reap(run_task)
                     await _reap(reader_task)
@@ -536,20 +780,20 @@ async def main():
 
                 csv_paths = find_run_csvs(replay_requested)
                 if not csv_paths:
-                    print(f"No runs found starting with '{replay_requested}_run_'")
+                    print(f"[{slot}] No runs found starting with '{replay_requested}_run_'")
                     current_script = MAIN_SCRIPT
                     continue
 
-                names = ", ".join(p.name for p in csv_paths)
-                print(f"Replaying average of {len(csv_paths)} run(s): {names}")
+                csv_names = ", ".join(p.name for p in csv_paths)
+                print(f"[{slot}] Replaying average of {len(csv_paths)} run(s): {csv_names}")
                 segments = build_segments(average_trajectories(csv_paths))
                 kinds = ", ".join(seg[0] for seg in segments)
-                print(f"  {len(segments)} segment(s): {kinds}")
-                replay_script = build_replay_script(segments)
+                print(f"[{slot}]  {len(segments)} segment(s): {kinds}")
+                replay_script = build_replay_script(segments, slot)
                 try:
                     await hub.run(str(replay_script), wait=True, print_output=True)
                 except Exception as e:
-                    print(f"Replay error: {e}")
+                    print(f"[{slot}] Replay error: {e}")
                 finally:
                     replay_script.unlink(missing_ok=True)
 
@@ -559,9 +803,25 @@ async def main():
                 await hub.disconnect()
             except Exception:
                 pass
-    except KeyboardInterrupt:
+    except asyncio.CancelledError:
         close_run()
+        raise
+
+
+async def main():
+    RUNS_DIR.mkdir(exist_ok=True)
+    tasks = [asyncio.ensure_future(run_robot(slot)) for slot in range(1, NUM_ROBOTS + 1)]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            await _reap(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

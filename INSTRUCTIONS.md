@@ -13,15 +13,29 @@ setup, superseded by the CSV logging described below.
   prints lines the laptop parses (`RUN_START`, `ROW: ...`, `RUN_STOP`,
   `SELECTED: n`, `REPLAY_REQUEST: n`).
 - `record_run.py` -- runs on the laptop. Holds one persistent Bluetooth
-  connection to the hub, keeps `update_robot_code_pybricks.py` running on it,
-  logs recordings to `runs/*.csv`, and handles replay requests by building
-  and running a one-off replay program on the hub. This is the thing you
-  actually run: `python3 record_run.py`.
+  connection *per robot*, up to `NUM_ROBOTS` (set at the top of the file)
+  connected at once, keeps `update_robot_code_pybricks.py` running on
+  each, logs recordings to `runs/*.csv`, and handles replay requests per
+  robot by building and running a one-off replay program on that hub.
+  This is the thing you actually run: `python3 record_run.py`. Robots
+  aren't individually identified -- each connects to whichever Pybricks
+  hub is currently advertising (a hub stops advertising once connected,
+  so concurrent connection attempts naturally spread across different
+  physical hubs), and all of them share the same `runs/` folder.
 - `push_ble.py` -- a simpler one-off tool: `python3 push_ble.py [script.py]`
   pushes and runs a single script over Bluetooth, streaming its output, then
   exits. Useful for testing a script by hand. `record_run.py` shells out to
   this internally for some cases, but mostly talks to the hub directly.
-- `runs/` -- recorded telemetry, one CSV per recording. See `runs/README.md`.
+- `generate_deterministic.py` -- `python3 generate_deterministic.py <n>`
+  converts `runs/<n>_run_*.csv` into `runs/<n>_deterministic.py`: a flat,
+  hand-editable Pybricks program (`drive()`/`turn()`/`arm_to()` calls with
+  gyro-based heading correction) instead of the data-table approach
+  `record_run.py`'s own replay uses. Generate once, then hand-tune the
+  `PROGRAM` list in the output file directly -- it won't be regenerated
+  or overwritten automatically. Push it to the hub with
+  `python3 push_ble.py runs/<n>_deterministic.py`.
+- `runs/` -- recorded telemetry shared across all connected robots, one
+  CSV per recording. See `runs/README.md`.
 
 ## Hub controls (running update_robot_code_pybricks.py)
 
@@ -33,19 +47,24 @@ The display shows `H` (home) when idle.
   replay.
 - **RIGHT** with a number selected: count back down towards home.
 - **CENTER** with a number selected (not `H`): request a replay of
-  `runs/<n>_run_*.csv`.
+  `runs/<n>_run_*.csv` (shared across all connected robots).
 - **CENTER pressed 3 times** during a replay: abort it and return home.
+
+Each connected robot runs this independently and concurrently -- recording
+or replaying on one doesn't block or interact with any other.
 
 ## Recording -> replay workflow
 
-1. Run `python3 record_run.py` and leave it running in a terminal.
-2. On the hub, RIGHT to record, move the robot, CENTER to stop. This saves
+1. Run `python3 record_run.py` and leave it running in a terminal -- it
+   connects to up to `NUM_ROBOTS` Pybricks hubs, whichever are currently
+   on and in range.
+2. On a hub, RIGHT to record, move the robot, CENTER to stop. This saves
    `runs/run_<timestamp>.csv` (not numbered automatically).
 3. Rename the run(s) you want replayable to `<n>_run_...csv` yourself, e.g.
    `3_run_20260904_193417.csv`. Multiple files can share a prefix (e.g.
    `3_run_a.csv`, `3_run_b.csv`) -- replaying `3` averages all of them
    sample-by-sample (truncated to the shortest one).
-4. On the hub, LEFT to count up to `n`, then CENTER to replay.
+4. On any connected hub, LEFT to count up to `n`, then CENTER to replay.
 
 Each recorded row has cumulative drive motor angles (`left`, `right`), the
 change since the last sample (`dleft`, `dright`), the hub's IMU `heading`

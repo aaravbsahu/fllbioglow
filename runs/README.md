@@ -1,9 +1,15 @@
 # Runs
 
-Motor telemetry logged from the robot, written by `record_run.py`.
+Motor telemetry logged from the robot(s), written by `record_run.py`.
 
-On the hub: press the **right** button to start a recording, press **center** to
-stop it. Each start/stop pair produces one CSV file here named
+`record_run.py` connects to up to `NUM_ROBOTS` Pybricks hubs at once --
+whichever are currently advertising -- and treats them identically,
+saving all recordings into this same shared folder. There's no
+identification between robots; recordings/replays just happen on
+whichever physical hub you press the buttons on.
+
+On a hub: press the **right** button to start a recording, press **center** to
+stop it. Each start/stop pair produces one CSV file here, named
 `run_YYYYMMDD_HHMMSS.csv`. Columns:
 
 ```
@@ -27,9 +33,10 @@ timestamp,left,right,dleft,dright,heading,right_arm,left_arm,dright_arm,dleft_ar
 ## Replaying a run
 
 Recordings aren't numbered automatically -- rename the one(s) you want to
-replay to `<N>_run_...csv` yourself. Then on the hub, press **left** to
+replay to `<N>_run_...csv` yourself. Then on a hub, press **left** to
 count up to that number (the display shows it), and press **center** to
-replay it.
+replay it -- any connected hub can replay any recording, since they all
+share this one folder.
 
 Multiple files can share the same `<N>` prefix (e.g. `3_run_a.csv`,
 `3_run_b.csv`, `3_run_c.csv`). `record_run.py` averages their
