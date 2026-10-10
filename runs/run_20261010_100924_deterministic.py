@@ -1,12 +1,14 @@
-"""Deterministic replay, generated from 1_run_20261004_110715.csv.
+"""Deterministic replay, generated from run_20261010_100924.csv.
 
 Hand-edit the numbers in PROGRAM below to fine-tune -- each tuple is one
 step, run in order:
-  ("drive", encoder_degrees)   -- straight, holding heading via gyro
-  ("turn", degrees)            -- relative pivot turn, gyro-corrected
-  ("arm", right_angle, left_angle)  -- move arms to these angles
+  ("drive", encoder_degrees, speed)   -- straight, holding heading via gyro
+  ("turn", degrees, speed)            -- relative pivot turn, gyro-corrected
+  ("arm", right_angle, left_angle, speed)  -- move arms to these angles
     (relative to wherever the arms were at program start)
-Delete a step, change a number, add a new one -- it's just a list.
+`speed` is deg/s -- the wheel (drive/turn) or motor (arm) speed cap for
+just that step. Delete a step, change a number, add a new one -- it's
+just a list.
 """
 from pybricks.hubs import PrimeHub
 from pybricks.pupdevices import Motor
@@ -22,9 +24,10 @@ right_motor = Motor(Port.E)
 right_arm_motor = Motor(Port.C)
 left_arm_motor = Motor(Port.D)
 
-CRUISE = 600        # deg/s wheel speed while driving straight
+CRUISE = 600        # deg/s default wheel speed cap for drive() (per-step override via PROGRAM)
 KP_HEAD = 9.0        # steering gain, both drive() and turn()
-MAX_CMD = 950        # deg/s hard cap per wheel
+MAX_CMD = 950        # deg/s hard cap per wheel, and default turn() speed
+ARM_SPEED = 200      # deg/s default arm motor speed (per-step override via PROGRAM)
 DRIVE_TOL = 15       # encoder-deg: close enough to end a drive() leg
 TURN_TOL = 4         # deg: close enough to end a turn() leg
 ARM_TOL = 8          # motor-deg: close enough to end an arm_to() step
@@ -56,9 +59,9 @@ def check_abort():
     return aborted
 
 
-def drive(distance):
-    """Drive `distance` encoder-degrees straight, holding the heading we
-    had when this step started."""
+def drive(distance, speed=CRUISE):
+    """Drive `distance` encoder-degrees straight at up to `speed` deg/s,
+    holding the heading we had when this step started."""
     target_heading = hub.imu.heading()
     start = dist_now()
     target = start + distance
@@ -69,7 +72,7 @@ def drive(distance):
         err = target - dist_now()
         if abs(err) <= DRIVE_TOL or timer.time() > STEP_TIMEOUT_MS:
             break
-        drive_cmd = clamp(3.0 * err, CRUISE)
+        drive_cmd = clamp(3.0 * err, speed)
         turn_cmd = KP_HEAD * (hub.imu.heading() - target_heading)
         left_motor.run(clamp(-drive_cmd + turn_cmd, MAX_CMD))
         right_motor.run(clamp(drive_cmd + turn_cmd, MAX_CMD))
@@ -78,9 +81,9 @@ def drive(distance):
     right_motor.stop()
 
 
-def turn(angle):
-    """Pivot turn by `angle` degrees relative to the current heading,
-    using the gyro to stop exactly there."""
+def turn(angle, speed=MAX_CMD):
+    """Pivot turn by `angle` degrees relative to the current heading, at
+    up to `speed` deg/s, using the gyro to stop exactly there."""
     target_heading = hub.imu.heading() + angle
     timer = StopWatch()
     while not (aborted or watchdog.time() > WATCHDOG_MS):
@@ -89,7 +92,7 @@ def turn(angle):
         err = hub.imu.heading() - target_heading
         if abs(err) <= TURN_TOL or timer.time() > STEP_TIMEOUT_MS:
             break
-        turn_cmd = clamp(KP_HEAD * err, MAX_CMD)
+        turn_cmd = clamp(KP_HEAD * err, speed)
         left_motor.run(turn_cmd)
         right_motor.run(turn_cmd)
         wait(20)
@@ -101,49 +104,30 @@ right_arm_zero = right_arm_motor.angle()
 left_arm_zero = left_arm_motor.angle()
 
 
-def arm_to(right_angle, left_angle):
-    """Move both arms to the given angles, relative to their position
-    when this program started."""
+def arm_to(right_angle, left_angle, speed=ARM_SPEED):
+    """Move both arms to the given angles at up to `speed` deg/s, relative
+    to their position when this program started."""
+    right_arm_motor.run_target(speed, right_arm_zero + right_angle, wait=False)
+    left_arm_motor.run_target(speed, left_arm_zero + left_angle, wait=False)
     timer = StopWatch()
     while not (aborted or watchdog.time() > WATCHDOG_MS):
         if check_abort():
             break
-        right_arm_motor.track_target(right_arm_zero + right_angle)
-        left_arm_motor.track_target(left_arm_zero + left_angle)
         ra_now = right_arm_motor.angle() - right_arm_zero
         la_now = left_arm_motor.angle() - left_arm_zero
         reached = abs(ra_now - right_angle) <= ARM_TOL and abs(la_now - left_angle) <= ARM_TOL
         if reached or timer.time() > STEP_TIMEOUT_MS:
             break
         wait(20)
+    right_arm_motor.hold()
+    left_arm_motor.hold()
 
 
 # PROGRAM: edit freely. Run in order, top to bottom.
 PROGRAM = [
-    ('drive', 652.0),
-    ('arm', -6.0, -2.0),
-    ('arm', -1.0, -2.0),
-    ('arm', 41.0, -2.0),
-    ('arm', 3.0, -2.0),
-    ('arm', -14.0, -2.0),
-    ('arm', -42.0, -2.0),
-    ('arm', -74.0, -2.0),
-    ('arm', -64.0, -2.0),
-    ('arm', 8.0, -2.0),
-    ('arm', 15.0, -2.0),
-    ('arm', 30.0, -2.0),
-    ('drive', 36.5),
-    ('arm', 26.0, -2.0),
-    ('arm', -1.0, -2.0),
-    ('arm', -6.0, -2.0),
-    ('arm', -19.0, -2.0),
-    ('arm', -24.0, -2.0),
-    ('arm', -41.0, -2.0),
-    ('arm', -70.0, -2.0),
-    ('arm', -87.0, -2.0),
-    ('arm', -93.0, -2.0),
-    ('arm', -87.0, -2.0),
-    ('drive', -709.5),
+    ('drive', 908.5, 600),
+    ('drive', 77.0, 600),
+    ('drive', -124.5, 600),
 ]
 
 for step in PROGRAM:
@@ -151,10 +135,10 @@ for step in PROGRAM:
         break
     kind = step[0]
     if kind == "drive":
-        drive(step[1])
+        drive(step[1], step[2])
     elif kind == "turn":
-        turn(step[1])
+        turn(step[1], step[2])
     else:
-        arm_to(step[1], step[2])
+        arm_to(step[1], step[2], step[3])
 
 print("DETERMINISTIC_ABORTED" if aborted else "DETERMINISTIC_DONE")

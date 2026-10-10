@@ -348,6 +348,16 @@ def find_run_csvs(n):
     return sorted(RUNS_DIR.glob(f"{n}_run_*.csv"))
 
 
+def find_deterministic_script(n):
+    """If a hand-tuned deterministic script exists for prefix `n`, returns
+    the most recently modified match -- these are preferred over the
+    table-driven CSV replay since they may have been edited by hand."""
+    matches = sorted(RUNS_DIR.glob(f"{n}_run_*_deterministic.py"))
+    if not matches:
+        return None
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
 def read_trajectory(csv_path):
     """Returns [(dist, heading, right_arm, left_arm)] for a recording, dist
     and arm angles zeroed to start at 0. dist is the encoder proxy
@@ -454,23 +464,46 @@ def build_replay_script(segments, slot):
 TURN_HEADING_THRESH = 3  # deg/sample: a row counts as "turning" past this
 MIN_DRIVE_DIST = 10      # encoder-deg: skip legs smaller than this (noise)
 MIN_TURN_ANGLE = 3       # deg: skip turns smaller than this (noise)
+DIR_NOISE_THRESH = 2     # encoder-deg/sample: below this, keep previous
+                         # drive direction instead of treating it as a
+                         # reversal (sample-to-sample noise/backlash)
+
+# Default speeds baked into each generated step -- edit per-step in
+# PROGRAM to tune individual legs, or these to change the overall defaults
+# for newly generated programs. Must match the same-named constants in
+# DETERMINISTIC_TEMPLATE below.
+DEFAULT_DRIVE_SPEED = 600  # deg/s wheel speed cap
+DEFAULT_TURN_SPEED = 950   # deg/s wheel speed cap
+DEFAULT_ARM_SPEED = 200    # deg/s arm motor speed
 
 
 def _classify_rows(traj):
-    """Labels each row 'arm', 'turn', or 'drive' based on the change from
-    the previous row. Row 0 copies row 1's label (nothing to compare it
-    to)."""
+    """Labels each row 'arm', 'turn', 'drive+', or 'drive-' based on the
+    change from the previous row. A straight drive that reverses
+    direction (out and back) must NOT collapse into one net-zero-ish
+    "drive" leg, so forward and backward motion get distinct labels and
+    therefore split into separate legs in build_program -- otherwise a
+    long out-and-back excursion (same heading, opposite travel) looks
+    like barely any net movement at all. Direction uses hysteresis
+    (DIR_NOISE_THRESH) so sample noise doesn't cause spurious splits.
+    Row 0 copies row 1's label (nothing to compare it to)."""
     n = len(traj)
-    labels = ["drive"] * n
+    labels = ["drive+"] * n
+    direction = 1
     for i in range(1, n):
         d0, h0, ra0, la0 = traj[i - 1]
         d1, h1, ra1, la1 = traj[i]
+        dd, dh = d1 - d0, h1 - h0
         if abs(ra1 - ra0) + abs(la1 - la0) > ARM_ACTIVE_THRESH:
             labels[i] = "arm"
-        elif abs(h1 - h0) > TURN_HEADING_THRESH and abs(h1 - h0) > abs(d1 - d0):
+        elif abs(dh) > TURN_HEADING_THRESH and abs(dh) > abs(dd):
             labels[i] = "turn"
         else:
-            labels[i] = "drive"
+            if dd > DIR_NOISE_THRESH:
+                direction = 1
+            elif dd < -DIR_NOISE_THRESH:
+                direction = -1
+            labels[i] = "drive+" if direction == 1 else "drive-"
     if n > 1:
         labels[0] = labels[1]
     return labels
@@ -496,15 +529,27 @@ def build_program(traj):
 
         if label == "arm":
             for _, _, ra, la in chunk:
-                steps.append(("arm", round(ra, 1), round(la, 1)))
+                steps.append(("arm", round(ra, 1), round(la, 1), DEFAULT_ARM_SPEED))
+            # The robot can still drive/turn while the arm moves -- an
+            # "arm" row only means the arm changed enough to dominate the
+            # label, not that the wheels stood still. Emit whatever net
+            # drive/turn happened during this same span too (after the
+            # arm steps), so real distance/heading isn't silently
+            # dropped just because an arm move overlapped it.
+            dist_delta = chunk[-1][0] - chunk[0][0]
+            head_delta = chunk[-1][1] - chunk[0][1]
+            if abs(dist_delta) >= MIN_DRIVE_DIST:
+                steps.append(("drive", round(dist_delta, 1), DEFAULT_DRIVE_SPEED))
+            if abs(head_delta) >= MIN_TURN_ANGLE:
+                steps.append(("turn", round(head_delta, 1), DEFAULT_TURN_SPEED))
         elif label == "turn":
             delta = chunk[-1][1] - chunk[0][1]
             if abs(delta) >= MIN_TURN_ANGLE:
-                steps.append(("turn", round(delta, 1)))
+                steps.append(("turn", round(delta, 1), DEFAULT_TURN_SPEED))
         else:
             delta = chunk[-1][0] - chunk[0][0]
             if abs(delta) >= MIN_DRIVE_DIST:
-                steps.append(("drive", round(delta, 1)))
+                steps.append(("drive", round(delta, 1), DEFAULT_DRIVE_SPEED))
         i = j
     return steps
 
@@ -513,11 +558,13 @@ DETERMINISTIC_TEMPLATE = '''"""Deterministic replay, generated from {source}.
 
 Hand-edit the numbers in PROGRAM below to fine-tune -- each tuple is one
 step, run in order:
-  ("drive", encoder_degrees)   -- straight, holding heading via gyro
-  ("turn", degrees)            -- relative pivot turn, gyro-corrected
-  ("arm", right_angle, left_angle)  -- move arms to these angles
+  ("drive", encoder_degrees, speed)   -- straight, holding heading via gyro
+  ("turn", degrees, speed)            -- relative pivot turn, gyro-corrected
+  ("arm", right_angle, left_angle, speed)  -- move arms to these angles
     (relative to wherever the arms were at program start)
-Delete a step, change a number, add a new one -- it's just a list.
+`speed` is deg/s -- the wheel (drive/turn) or motor (arm) speed cap for
+just that step. Delete a step, change a number, add a new one -- it's
+just a list.
 """
 from pybricks.hubs import PrimeHub
 from pybricks.pupdevices import Motor
@@ -533,9 +580,10 @@ right_motor = Motor(Port.E)
 right_arm_motor = Motor(Port.C)
 left_arm_motor = Motor(Port.D)
 
-CRUISE = 600        # deg/s wheel speed while driving straight
+CRUISE = 600        # deg/s default wheel speed cap for drive() (per-step override via PROGRAM)
 KP_HEAD = 9.0        # steering gain, both drive() and turn()
-MAX_CMD = 950        # deg/s hard cap per wheel
+MAX_CMD = 950        # deg/s hard cap per wheel, and default turn() speed
+ARM_SPEED = 200      # deg/s default arm motor speed (per-step override via PROGRAM)
 DRIVE_TOL = 15       # encoder-deg: close enough to end a drive() leg
 TURN_TOL = 4         # deg: close enough to end a turn() leg
 ARM_TOL = 8          # motor-deg: close enough to end an arm_to() step
@@ -567,9 +615,9 @@ def check_abort():
     return aborted
 
 
-def drive(distance):
-    """Drive `distance` encoder-degrees straight, holding the heading we
-    had when this step started."""
+def drive(distance, speed=CRUISE):
+    """Drive `distance` encoder-degrees straight at up to `speed` deg/s,
+    holding the heading we had when this step started."""
     target_heading = hub.imu.heading()
     start = dist_now()
     target = start + distance
@@ -580,7 +628,7 @@ def drive(distance):
         err = target - dist_now()
         if abs(err) <= DRIVE_TOL or timer.time() > STEP_TIMEOUT_MS:
             break
-        drive_cmd = clamp(3.0 * err, CRUISE)
+        drive_cmd = clamp(3.0 * err, speed)
         turn_cmd = KP_HEAD * (hub.imu.heading() - target_heading)
         left_motor.run(clamp(-drive_cmd + turn_cmd, MAX_CMD))
         right_motor.run(clamp(drive_cmd + turn_cmd, MAX_CMD))
@@ -589,9 +637,9 @@ def drive(distance):
     right_motor.stop()
 
 
-def turn(angle):
-    """Pivot turn by `angle` degrees relative to the current heading,
-    using the gyro to stop exactly there."""
+def turn(angle, speed=MAX_CMD):
+    """Pivot turn by `angle` degrees relative to the current heading, at
+    up to `speed` deg/s, using the gyro to stop exactly there."""
     target_heading = hub.imu.heading() + angle
     timer = StopWatch()
     while not (aborted or watchdog.time() > WATCHDOG_MS):
@@ -600,7 +648,7 @@ def turn(angle):
         err = hub.imu.heading() - target_heading
         if abs(err) <= TURN_TOL or timer.time() > STEP_TIMEOUT_MS:
             break
-        turn_cmd = clamp(KP_HEAD * err, MAX_CMD)
+        turn_cmd = clamp(KP_HEAD * err, speed)
         left_motor.run(turn_cmd)
         right_motor.run(turn_cmd)
         wait(20)
@@ -612,21 +660,23 @@ right_arm_zero = right_arm_motor.angle()
 left_arm_zero = left_arm_motor.angle()
 
 
-def arm_to(right_angle, left_angle):
-    """Move both arms to the given angles, relative to their position
-    when this program started."""
+def arm_to(right_angle, left_angle, speed=ARM_SPEED):
+    """Move both arms to the given angles at up to `speed` deg/s, relative
+    to their position when this program started."""
+    right_arm_motor.run_target(speed, right_arm_zero + right_angle, wait=False)
+    left_arm_motor.run_target(speed, left_arm_zero + left_angle, wait=False)
     timer = StopWatch()
     while not (aborted or watchdog.time() > WATCHDOG_MS):
         if check_abort():
             break
-        right_arm_motor.track_target(right_arm_zero + right_angle)
-        left_arm_motor.track_target(left_arm_zero + left_angle)
         ra_now = right_arm_motor.angle() - right_arm_zero
         la_now = left_arm_motor.angle() - left_arm_zero
         reached = abs(ra_now - right_angle) <= ARM_TOL and abs(la_now - left_angle) <= ARM_TOL
         if reached or timer.time() > STEP_TIMEOUT_MS:
             break
         wait(20)
+    right_arm_motor.hold()
+    left_arm_motor.hold()
 
 
 # PROGRAM: edit freely. Run in order, top to bottom.
@@ -639,11 +689,11 @@ for step in PROGRAM:
         break
     kind = step[0]
     if kind == "drive":
-        drive(step[1])
+        drive(step[1], step[2])
     elif kind == "turn":
-        turn(step[1])
+        turn(step[1], step[2])
     else:
-        arm_to(step[1], step[2])
+        arm_to(step[1], step[2], step[3])
 
 print("DETERMINISTIC_ABORTED" if aborted else "DETERMINISTIC_DONE")
 '''
@@ -687,6 +737,13 @@ async def run_robot(slot):
         if run_file:
             run_file.close()
             print(f"[{slot}] Saved {run_path}")
+            saved_path = run_path
+            det_path = saved_path.with_name(saved_path.stem + "_deterministic.py")
+            try:
+                program = build_deterministic_script([saved_path], det_path)
+                print(f"[{slot}] Wrote {det_path} ({len(program)} step(s))")
+            except Exception as e:
+                print(f"[{slot}] Deterministic script generation failed: {e!r}")
         run_file = run_writer = run_path = None
 
     try:
@@ -766,6 +823,21 @@ async def run_robot(slot):
                     await _reap(reader_task)
                     break
 
+                # The connection state observable doesn't always flip to
+                # DISCONNECTED when the link is actually dead -- a failed
+                # BLE write (e.g. "Unknown ATT error") can leave
+                # _is_connected() reporting True forever while hub.run()
+                # keeps failing instantly, spinning this loop with zero
+                # delay. Treat a failed run_task the same as a real
+                # disconnect: force a reconnect instead of retrying here.
+                if run_task.done() and not run_task.cancelled() and run_task.exception() is not None:
+                    print(f"[{slot}] Run failed ({run_task.exception()!r}), forcing reconnect...")
+                    reader_task.cancel()
+                    await _reap(run_task)
+                    await _reap(reader_task)
+                    await asyncio.sleep(1)
+                    break
+
                 if reader_task.done() and not reader_task.cancelled():
                     await hub.stop_user_program()
                     await run_task
@@ -775,6 +847,30 @@ async def run_robot(slot):
                 await _reap(reader_task)
 
                 if replay_requested is None:
+                    current_script = MAIN_SCRIPT
+                    continue
+
+                det_script = find_deterministic_script(replay_requested)
+                if det_script is not None:
+                    print(f"[{slot}] Running deterministic script: {det_script.name}")
+                    # pybricksdev resolves the main script relative to the
+                    # process's cwd (REPO_ROOT), not the script's own
+                    # directory -- so a path under runs/ fails to open.
+                    # Stage a temp copy at REPO_ROOT and run that instead,
+                    # leaving the real (hand-editable) file untouched.
+                    staged = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".py", prefix=f"_det_{slot}_",
+                        delete=False, dir=REPO_ROOT,
+                    )
+                    staged.write(det_script.read_text())
+                    staged.close()
+                    staged_path = Path(staged.name)
+                    try:
+                        await hub.run(str(staged_path), wait=True, print_output=True)
+                    except Exception as e:
+                        print(f"[{slot}] Deterministic run error: {e}")
+                    finally:
+                        staged_path.unlink(missing_ok=True)
                     current_script = MAIN_SCRIPT
                     continue
 

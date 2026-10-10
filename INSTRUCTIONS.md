@@ -30,10 +30,15 @@ setup, superseded by the CSV logging described below.
   converts `runs/<n>_run_*.csv` into `runs/<n>_deterministic.py`: a flat,
   hand-editable Pybricks program (`drive()`/`turn()`/`arm_to()` calls with
   gyro-based heading correction) instead of the data-table approach
-  `record_run.py`'s own replay uses. Generate once, then hand-tune the
-  `PROGRAM` list in the output file directly -- it won't be regenerated
-  or overwritten automatically. Push it to the hub with
-  `python3 push_ble.py runs/<n>_deterministic.py`.
+  `record_run.py`'s own replay uses. `record_run.py` also runs this
+  automatically right after every recording is saved (see below), writing
+  `runs/<original CSV name>_deterministic.py` next to it -- so only run
+  this script by hand to regenerate one on demand (e.g. after editing the
+  generator itself). Either way, hand-tune the `PROGRAM` list in the
+  output file afterward: each step is `("drive", dist, speed)`,
+  `("turn", angle, speed)`, or `("arm", right, left, speed)` -- `speed` is
+  deg/s, editable per step. Push it to the hub with
+  `python3 push_ble.py runs/<n>_..._deterministic.py`.
 - `runs/` -- recorded telemetry shared across all connected robots, one
   CSV per recording. See `runs/README.md`.
 
@@ -47,7 +52,9 @@ The display shows `H` (home) when idle.
   replay.
 - **RIGHT** with a number selected: count back down towards home.
 - **CENTER** with a number selected (not `H`): request a replay of
-  `runs/<n>_run_*.csv` (shared across all connected robots).
+  `runs/<n>_run_*.csv` (shared across all connected robots) -- or, if a
+  matching `runs/<n>_run_*_deterministic.py` exists, that's run directly
+  instead (see below).
 - **CENTER pressed 3 times** during a replay: abort it and return home.
 
 Each connected robot runs this independently and concurrently -- recording
@@ -59,12 +66,24 @@ or replaying on one doesn't block or interact with any other.
    connects to up to `NUM_ROBOTS` Pybricks hubs, whichever are currently
    on and in range.
 2. On a hub, RIGHT to record, move the robot, CENTER to stop. This saves
-   `runs/run_<timestamp>.csv` (not numbered automatically).
+   `runs/run_<timestamp>.csv` (not numbered automatically), and
+   immediately also writes `runs/run_<timestamp>_deterministic.py` next
+   to it (see `generate_deterministic.py` above) -- generated fresh every
+   time, so don't hand-edit it until after the number-renaming step below.
 3. Rename the run(s) you want replayable to `<n>_run_...csv` yourself, e.g.
-   `3_run_20260904_193417.csv`. Multiple files can share a prefix (e.g.
-   `3_run_a.csv`, `3_run_b.csv`) -- replaying `3` averages all of them
-   sample-by-sample (truncated to the shortest one).
+   `3_run_20260904_193417.csv`, **and** rename its matching
+   `..._deterministic.py` file to the same `<n>_run_..._deterministic.py`
+   pattern if you want that one preferred. Multiple CSVs can share a
+   prefix (e.g. `3_run_a.csv`, `3_run_b.csv`) -- replaying `3` averages
+   all of them sample-by-sample (truncated to the shortest one) when no
+   deterministic script is found for that prefix.
 4. On any connected hub, LEFT to count up to `n`, then CENTER to replay.
+   If `runs/<n>_run_*_deterministic.py` exists (pick the most recently
+   modified one if several match), it's pushed and run as-is, numbered
+   CSVs and all; otherwise falls back to the table-driven CSV replay.
+   This means hand-edits you make to a deterministic script are what
+   actually runs -- it's never silently regenerated or overwritten by
+   `record_run.py` once you've renamed/numbered it.
 
 Each recorded row has cumulative drive motor angles (`left`, `right`), the
 change since the last sample (`dleft`, `dright`), the hub's IMU `heading`
