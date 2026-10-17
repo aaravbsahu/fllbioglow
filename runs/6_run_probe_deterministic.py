@@ -1,11 +1,15 @@
-"""Deterministic replay, generated from run_20261010_101325.csv.
+"""Deterministic replay, generated from probe.
 
 Hand-edit the numbers in PROGRAM below to fine-tune -- each tuple is one
 step, run in order:
   ("drive", encoder_degrees, speed)   -- straight, holding heading via gyro
   ("turn", degrees, speed)            -- relative pivot turn, gyro-corrected
   ("arm", right_angle, left_angle, speed)  -- move arms to these angles
-    (relative to wherever the arms were at program start)
+    (relative to wherever the arms were at program start, or since the
+    last relax_arm() of that arm)
+  ("relax_arm", "right"|"left"|"both")  -- coast that arm motor so it can
+    be pushed freely by hand, and make wherever it ends up the new zero
+    for later "arm" steps on that motor
 `speed` is deg/s -- the wheel (drive/turn) or motor (arm) speed cap for
 just that step. Delete a step, change a number, add a new one -- it's
 just a list.
@@ -31,8 +35,15 @@ ARM_SPEED = 200      # deg/s default arm motor speed (per-step override via PROG
 DRIVE_TOL = 15       # encoder-deg: close enough to end a drive() leg
 TURN_TOL = 4         # deg: close enough to end a turn() leg
 ARM_TOL = 8          # motor-deg: close enough to end an arm_to() step
-STEP_TIMEOUT_MS = 6000
+STEP_TIMEOUT_MS = 4000   # hard cap per step
+STALL_MS = 800           # give up on a drive/turn that makes no progress this long
+STALL_PROGRESS_DRIVE = 6 # encoder-deg of improvement that counts as progress
+STALL_PROGRESS_TURN = 1.5 # deg of improvement that counts as progress
 WATCHDOG_MS = 180000
+RELAX_SETTLE_TOL = 3        # motor-deg: movement below this counts as "still"
+RELAX_QUIET_MS = 300        # must stay still this long to count as settled
+RELAX_TICK_MS = 50
+RELAX_TIMEOUT_MS = 3000     # give up waiting for the arm to stop moving
 
 watchdog = StopWatch()
 press_count = 0
@@ -66,11 +77,18 @@ def drive(distance, speed=CRUISE):
     start = dist_now()
     target = start + distance
     timer = StopWatch()
+    stall = StopWatch()
+    best = None
     while not (aborted or watchdog.time() > WATCHDOG_MS):
         if check_abort():
             break
         err = target - dist_now()
         if abs(err) <= DRIVE_TOL or timer.time() > STEP_TIMEOUT_MS:
+            break
+        if best is None or abs(err) < best - STALL_PROGRESS_DRIVE:
+            best = abs(err)
+            stall.reset()
+        elif stall.time() > STALL_MS:
             break
         drive_cmd = clamp(3.0 * err, speed)
         turn_cmd = KP_HEAD * (hub.imu.heading() - target_heading)
@@ -86,11 +104,18 @@ def turn(angle, speed=MAX_CMD):
     up to `speed` deg/s, using the gyro to stop exactly there."""
     target_heading = hub.imu.heading() + angle
     timer = StopWatch()
+    stall = StopWatch()
+    best = None
     while not (aborted or watchdog.time() > WATCHDOG_MS):
         if check_abort():
             break
         err = hub.imu.heading() - target_heading
         if abs(err) <= TURN_TOL or timer.time() > STEP_TIMEOUT_MS:
+            break
+        if best is None or abs(err) < best - STALL_PROGRESS_TURN:
+            best = abs(err)
+            stall.reset()
+        elif stall.time() > STALL_MS:
             break
         turn_cmd = clamp(KP_HEAD * err, speed)
         left_motor.run(turn_cmd)
@@ -123,23 +148,69 @@ def arm_to(right_angle, left_angle, speed=ARM_SPEED):
     left_arm_motor.hold()
 
 
+def relax_arm(which):
+    """Coast the named arm motor ("right", "left", or "both") so it is
+    completely free (a raised arm falls under its own weight), wait until
+    it has stopped moving, then make the resting angle the new zero for
+    later arm steps. Prints RELAX <angle(s)> each tick for debugging."""
+    global right_arm_zero, left_arm_zero
+    motors = []
+    if which in ("right", "both"):
+        motors.append(right_arm_motor)
+    if which in ("left", "both"):
+        motors.append(left_arm_motor)
+
+    n = len(motors)
+    for m in motors:
+        m.stop()
+    last = [m.angle() for m in motors]
+    still = [0] * n
+    timer = StopWatch()
+    while timer.time() < RELAX_TIMEOUT_MS:
+        if check_abort():
+            break
+        wait(RELAX_TICK_MS)
+        for i in range(n):
+            now = motors[i].angle()
+            if abs(now - last[i]) > RELAX_SETTLE_TOL:
+                still[i] = 0
+                last[i] = now
+            else:
+                still[i] += RELAX_TICK_MS
+        print("RELAX", which, timer.time(), last, still)
+        if min(still) >= RELAX_QUIET_MS:
+            break
+
+    if which in ("right", "both"):
+        right_arm_zero = right_arm_motor.angle()
+    if which in ("left", "both"):
+        left_arm_zero = left_arm_motor.angle()
+
+
+def probe(which, ms):
+    """Debug: print angle/speed/load every 100ms. First half holds the
+    motor at its current angle (push it by hand and watch load), second
+    half coasts."""
+    m = right_arm_motor if which == "right" else left_arm_motor
+    timer = StopWatch()
+    m.hold()
+    phase = "HOLD"
+    while timer.time() < ms:
+        if check_abort():
+            break
+        if phase == "HOLD" and timer.time() >= ms // 2:
+            m.stop()
+            phase = "COAST"
+        print("PROBE", phase, timer.time(), m.angle(), m.speed(), m.load())
+        wait(100)
+    m.stop()
+
+
 # PROGRAM: edit freely. Run in order, top to bottom.
+#   ("relax_arm", "right"|"left"|"both")  -- coast that arm motor and
+#     make wherever it ends up the new zero for later arm steps
 PROGRAM = [
-    ('drive', 1032.0, 600),
-    ('drive', 547.0, 600),
-    ('arm', -4.0, 0.0, 200),
-    ('arm', -76.0, 0.0, 200),
-    ('arm', -96.0, 0.0, 200),
-    ('arm', -92.0, 0.0, 200),
-    ('arm', -97.0, 0.0, 200),
-    ('arm', -110.0, 0.0, 200),
-    ('arm', -159.0, 0.0, 200),
-    ('drive', -571.5, 600),
-    ('turn', -7.0, 950),
-    ('drive', -24.0, 600),
-    ('arm', -154.0, 0.0, 200),
-    ('turn', 125.8, 950),
-    ('turn', -93.0, 950),
+    ('probe', 'right', 12000),
 ]
 
 for step in PROGRAM:
@@ -150,6 +221,10 @@ for step in PROGRAM:
         drive(step[1], step[2])
     elif kind == "turn":
         turn(step[1], step[2])
+    elif kind == "relax_arm":
+        relax_arm(step[1])
+    elif kind == "probe":
+        probe(step[1], step[2])
     else:
         arm_to(step[1], step[2], step[3])
 
