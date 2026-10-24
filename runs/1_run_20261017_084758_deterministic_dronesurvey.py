@@ -210,10 +210,13 @@ def probe(which, ms):
 #   ("relax_arm", "right"|"left"|"both")  -- coast that arm motor and
 #     make wherever it ends up the new zero for later arm steps
 PROGRAM = [
-    ('drive', 1325.5, 400),
-    ('turn', -50.2, 950),
+    ('drive', 1225.5, 400),
+    ('turn', -20.2, 950),
+    ('drive', 68.5, 400),
+    ('turn', -25.2, 950),
+    # doubletap
     ('turn', 20.2, 950),
-    ('turn', -30.2, 1000),
+    ('turn', -50.2, 1000),
     ('turn', 23.2, 950),
     ('drive', 50.0, 400),
     ('turn', 23.2, 950),
@@ -221,7 +224,9 @@ PROGRAM = [
     ('turn', 20.2, 950),
     ('drive', 25.0, 400),
     ('turn', 10.2, 950),
-    ('drive', -1736.0, 600),
+    ('drive', -500.0, 400),
+    ('turn', 50.2, 950),
+    ('drive', -1436.0, 400),
 ]
 
 for step in PROGRAM:
