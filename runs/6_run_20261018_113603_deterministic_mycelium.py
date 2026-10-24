@@ -267,11 +267,11 @@ def probe(which, ms):
 #   ("zero_arm", "right"|"left"|"both", speed)  -- move that arm to motor angle 0 (absolute)
 PROGRAM = [
     ('drive', 107.5, 600),
-    ('turn', -10.3, 950),
-    ('drive', 1377.5, 600),
-    ('turn', 65.3, 950),
-    ('drive', 409.0, 200),
-    ('arm', -169.0, -126.0, 200),
+    ('turn', -11.3, 950),
+    ('drive', 1250.5, 600),
+    ('turn', 55.0, 950),
+    ('drive', 412.0, 200),
+    ('arm', -175.0, -130.0, 200),
     ('arm', -200.0, -160.0, 200),
     # ('turn', 35.2, 950),
     # ('arm', 10.0, 0.0, 200),
